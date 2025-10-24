@@ -245,9 +245,10 @@ export function useObjectDetection(
         return;
       }
 
-      // Priority 3: Detect other obstacles (furniture, hazards, etc.)
+      // Priority 3: Detect other obstacles (furniture, hazards, structural objects, etc.)
       const obstacles = predictions.filter((p) =>
         [
+          // Furniture and indoor objects
           "chair",
           "couch",
           "bed",
@@ -260,6 +261,7 @@ export function useObjectDetection(
           "backpack",
           "handbag",
           "suitcase",
+          // Hazard objects
           "umbrella",
           "sports ball",
           "baseball bat",
@@ -274,12 +276,45 @@ export function useObjectDetection(
           "skateboard",
           "bicycle",
           "motorcycle helmet",
+          // Animals
           "dog",
           "cat",
           "bird",
           "teddy bear",
+          // Outdoor hazards
           "kite",
           "frisbee",
+          "stairs",
+          "step",
+          "ramp",
+          "escalator",
+          "elevator",
+          "pillar",
+          "column",
+          "barrier",
+          "gate",
+          "sign",
+          "lamp",
+          "street light",
+          "hydrant",
+          "mailbox",
+          "trash can",
+          "dumpster",
+          "wall",
+          "building",
+          "bridge",
+          "tunnel",
+          "curb",
+          "manhole",
+          "grate",
+          "bollard",
+          "post",
+          "tree",
+          "bush",
+          "rock",
+          "log",
+          "branch",
+          "stick",
         ].includes(p.class)
       );
 
