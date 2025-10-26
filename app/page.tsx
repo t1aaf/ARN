@@ -1,209 +1,532 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { DetectionCanvas } from "@/components/detection-canvas";
-import { useObjectDetection } from "@/hooks/use-object-detection";
-import { useSpeech } from "@/hooks/use-speech";
-import { Eye, Mic, Camera, Waves } from "lucide-react";
+import type React from "react";
 
-export default function ARGuidePage() {
-  const videoRef = useRef<HTMLVideoElement>(
-    null
-  ) as React.RefObject<HTMLVideoElement>;
-  const [isActive, setIsActive] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
-  const [isSpeechEnabled, setIsSpeechEnabled] = useState(true);
+import { useState, useEffect, useRef, useCallback } from "react";
+import * as cocoSsd from "@tensorflow-models/coco-ssd";
+import "@tensorflow/tfjs";
 
-  const { speak, isSpeaking, stopSpeaking, testSpeech } = useSpeech();
-  const { detections, isModelLoading, startDetection, stopDetection } =
-    useObjectDetection(videoRef, isSpeaking);
+interface Detection {
+  class: string;
+  score: number;
+  bbox: [number, number, number, number];
+}
 
+export function useObjectDetection(
+  videoRef: React.RefObject<HTMLVideoElement>,
+  isSpeaking = false
+) {
+  const [detections, setDetections] = useState<string[]>([]);
+  const [isModelLoading, setIsModelLoading] = useState(true);
+  const modelRef = useRef<cocoSsd.ObjectDetection | null>(null);
+  const detectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastAnnouncementRef = useRef<string>("");
+  const lastAnnouncementTimeRef = useRef<number>(0);
+  const lastDetectionRef = useRef<string>("");
+
+  // Load model on mount
   useEffect(() => {
-    const initialize = async () => {
+    const loadModel = async () => {
       try {
-        setError(null);
-
-        const mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "environment" },
-            width: { ideal: 1920, max: 1920 },
-            height: { ideal: 1080, max: 1080 },
-            aspectRatio: { ideal: 16 / 9 },
-          },
-          audio: false,
-        });
-
-        if (videoRef.current) {
-          videoRef.current.srcObject = mediaStream;
-          videoRef.current.setAttribute("playsinline", "true");
-          videoRef.current.setAttribute("webkit-playsinline", "true");
-          await videoRef.current.play();
-          setStream(mediaStream);
-          setIsActive(true);
-          await startDetection();
-
-          testSpeech();
-          setIsSpeechEnabled(true);
-        }
-      } catch (err) {
-        console.error("[v0] Initialization error:", err);
-        setError(
-          "Unable to access camera or speech. Please grant permissions and reload."
-        );
+        console.log("[v0] Loading COCO-SSD model...");
+        const model = await cocoSsd.load();
+        modelRef.current = model;
+        setIsModelLoading(false);
+        console.log("[v0] Model loaded successfully");
+      } catch (error) {
+        console.error("[v0] Error loading model:", error);
+        setIsModelLoading(false);
       }
     };
 
-    initialize();
+    loadModel();
 
     return () => {
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
+      if (detectionIntervalRef.current) {
+        clearInterval(detectionIntervalRef.current);
       }
-      stopDetection();
-      stopSpeaking();
     };
   }, []);
 
-  useEffect(() => {
-    if (!isSpeechEnabled || !isActive || detections.length === 0) return;
+  const estimateDistance = (
+    bbox: [number, number, number, number],
+    videoWidth: number,
+    objectClass = "person"
+  ): number => {
+    const [, , width, height] = bbox;
 
-    const announcement = detections[0];
-    if (announcement) {
-      speak(announcement);
-    }
-  }, [detections, isSpeechEnabled, isActive, speak]);
+    // Expected heights of common objects in meters
+    const expectedHeights: Record<string, number> = {
+      person: 1.7,
+      car: 1.5,
+      truck: 2.5,
+      motorcycle: 1.2,
+      bus: 3.0,
+      dog: 0.6,
+      cat: 0.3,
+      bicycle: 1.0,
+      chair: 0.8,
+      door: 2.0,
+      tree: 5.0,
+      pole: 0.3,
+      traffic_cone: 0.7,
+      bench: 0.5,
+      wall: 2.0,
+    };
 
-  return (
-    <div className="fixed inset-0 bg-gradient-to-br from-background via-background to-secondary overflow-hidden">
-      <header className="absolute top-0 left-0 right-0 z-20 p-4 md:p-6 bg-gradient-to-b from-background/80 to-transparent backdrop-blur-sm">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center justify-center w-10 h-10 md:w-12 md:h-12 rounded-full bg-primary/20 border border-primary/30">
-            <Eye className="w-5 h-5 md:w-6 md:h-6 text-primary" />
-          </div>
-          <div>
-            <h1 className="text-xl md:text-2xl lg:text-3xl font-bold text-foreground tracking-tight">
-              Vision Guide
-            </h1>
-            <p className="text-xs md:text-sm text-muted-foreground">
-              AI-powered navigation assistant
-            </p>
-          </div>
-        </div>
-      </header>
+    const expectedHeight = expectedHeights[objectClass] || 1.0;
 
-      <main className="absolute inset-0 flex items-center justify-center p-4 pt-24 pb-32 md:pt-28 md:pb-36">
-        {error && (
-          <Alert
-            variant="destructive"
-            className="absolute top-24 left-4 right-4 z-30 md:left-6 md:right-6"
-          >
-            <AlertDescription className="text-sm md:text-base">
-              {error}
-            </AlertDescription>
-          </Alert>
-        )}
+    // Assume 60-degree vertical field of view for most cameras
+    const verticalFOV = 60 * (Math.PI / 180);
+    const focalLength = videoWidth / (2 * Math.tan(verticalFOV / 2));
 
-        {isModelLoading && (
-          <Alert className="absolute top-24 left-4 right-4 z-30 md:left-6 md:right-6 bg-card/90 backdrop-blur-sm border-primary/30">
-            <AlertDescription className="text-sm md:text-base flex items-center gap-2">
-              <Waves className="w-4 h-4 animate-pulse text-primary" />
-              Loading AI detection model...
-            </AlertDescription>
-          </Alert>
-        )}
+    // Calculate distance using pinhole camera model
+    // distance = (expectedHeight * focalLength) / pixelHeight
+    const pixelHeight = height;
+    const distance = (expectedHeight * focalLength) / pixelHeight;
 
-        <div className="relative w-full h-full max-w-6xl rounded-2xl md:rounded-3xl overflow-hidden shadow-2xl border border-border/50">
-          <video
-            ref={videoRef}
-            className="absolute inset-0 w-full h-full object-cover"
-            playsInline
-            muted
-            autoPlay
-          />
-          {isActive && (
-            <DetectionCanvas videoRef={videoRef} detections={detections} />
-          )}
+    // Clamp distance to reasonable range (0.3m to 20m)
+    return Math.max(0.3, Math.min(20, Number.parseFloat(distance.toFixed(1))));
+  };
 
-          {!isActive && (
-            <div className="absolute inset-0 flex items-center justify-center bg-secondary/50 backdrop-blur-sm">
-              <div className="text-center space-y-3">
-                <Camera className="w-12 h-12 md:w-16 md:h-16 text-primary mx-auto animate-pulse" />
-                <p className="text-base md:text-lg text-foreground font-medium">
-                  Initializing camera...
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
-      </main>
+  const getPosition = (
+    bbox: [number, number, number, number],
+    videoWidth: number
+  ): string => {
+    const [x, , width] = bbox;
+    const centerX = x + width / 2;
+    const relativePosition = centerX / videoWidth;
 
-      {isActive && (
-        <footer className="absolute bottom-0 left-0 right-0 z-20 p-4 md:p-6 bg-gradient-to-t from-background/90 to-transparent backdrop-blur-md">
-          <div className="max-w-6xl mx-auto">
-            <div className="bg-card/60 backdrop-blur-xl border border-border/50 rounded-2xl p-4 md:p-6 shadow-xl">
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
-                {/* Camera Status */}
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-10 h-10 rounded-full bg-primary/20">
-                    <Camera className="w-5 h-5 text-primary" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-muted-foreground">Camera</p>
-                    <p className="text-sm font-semibold text-primary truncate">
-                      Active
-                    </p>
-                  </div>
-                </div>
+    if (relativePosition < 0.33) return "left";
+    if (relativePosition > 0.67) return "right";
+    return "center";
+  };
 
-                {/* Speech Status */}
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-10 h-10 rounded-full bg-primary/20">
-                    <Mic className="w-5 h-5 text-primary" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-muted-foreground">Speech</p>
-                    <p className="text-sm font-semibold text-primary truncate">
-                      Enabled
-                    </p>
-                  </div>
-                </div>
+  const detectWall = useCallback(
+    (
+      video: HTMLVideoElement
+    ): { hasWall: boolean; distance: number; position: string } | null => {
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
 
-                {/* Speaking Status */}
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-10 h-10 rounded-full bg-accent/20">
-                    <Waves
-                      className={`w-5 h-5 text-accent ${
-                        isSpeaking ? "animate-pulse" : ""
-                      }`}
-                    />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-muted-foreground">Status</p>
-                    <p className="text-sm font-semibold text-accent truncate">
-                      {isSpeaking ? "Speaking" : "Listening"}
-                    </p>
-                  </div>
-                </div>
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-                {/* Detection Status */}
-                <div className="flex items-center gap-3 col-span-2 lg:col-span-1">
-                  <div className="flex items-center justify-center w-10 h-10 rounded-full bg-accent/20">
-                    <Eye className="w-5 h-5 text-accent" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-muted-foreground">Detection</p>
-                    <p className="text-sm font-semibold text-foreground truncate">
-                      {detections[0] || "Scanning environment..."}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </footer>
-      )}
-    </div>
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+
+      // Analyze the center region for wall characteristics
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const regionSize = Math.min(canvas.width, canvas.height) / 3;
+
+      let edgeCount = 0;
+      const uniformityScore = 0;
+      let totalBrightness = 0;
+      let pixelCount = 0;
+
+      // Sobel edge detection in center region
+      for (
+        let y = centerY - regionSize / 2;
+        y < centerY + regionSize / 2;
+        y++
+      ) {
+        for (
+          let x = centerX - regionSize / 2;
+          x < centerX + regionSize / 2;
+          x++
+        ) {
+          if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height)
+            continue;
+
+          const idx = (y * canvas.width + x) * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+          const brightness = (r + g + b) / 3;
+
+          totalBrightness += brightness;
+          pixelCount++;
+
+          // Check for edges (high contrast)
+          if (x > 0 && x < canvas.width - 1 && y > 0 && y < canvas.height - 1) {
+            const leftIdx = (y * canvas.width + (x - 1)) * 4;
+            const rightIdx = (y * canvas.width + (x + 1)) * 4;
+            const topIdx = ((y - 1) * canvas.width + x) * 4;
+            const bottomIdx = ((y + 1) * canvas.width + x) * 4;
+
+            const leftBrightness =
+              (data[leftIdx] + data[leftIdx + 1] + data[leftIdx + 2]) / 3;
+            const rightBrightness =
+              (data[rightIdx] + data[rightIdx + 1] + data[rightIdx + 2]) / 3;
+            const topBrightness =
+              (data[topIdx] + data[topIdx + 1] + data[topIdx + 2]) / 3;
+            const bottomBrightness =
+              (data[bottomIdx] + data[bottomIdx + 1] + data[bottomIdx + 2]) / 3;
+
+            const edgeMagnitude =
+              Math.abs(leftBrightness - rightBrightness) +
+              Math.abs(topBrightness - bottomBrightness);
+            if (edgeMagnitude > 30) edgeCount++;
+          }
+        }
+      }
+
+      const avgBrightness = totalBrightness / pixelCount;
+      const edgeDensity = edgeCount / pixelCount;
+
+      // Wall detection: low edge density (flat surface) and moderate brightness
+      if (edgeDensity < 0.1 && avgBrightness > 50) {
+        // Closer walls appear brighter and more uniform
+        let distance = 10;
+
+        if (avgBrightness > 220) distance = 0.5;
+        else if (avgBrightness > 210) distance = 0.7;
+        else if (avgBrightness > 200) distance = 1.0;
+        else if (avgBrightness > 190) distance = 1.3;
+        else if (avgBrightness > 180) distance = 1.6;
+        else if (avgBrightness > 170) distance = 2.0;
+        else if (avgBrightness > 160) distance = 2.5;
+        else if (avgBrightness > 150) distance = 3.0;
+        else if (avgBrightness > 140) distance = 3.5;
+        else if (avgBrightness > 130) distance = 4.0;
+        else if (avgBrightness > 120) distance = 4.5;
+        else if (avgBrightness > 110) distance = 5.0;
+        else if (avgBrightness > 100) distance = 5.5;
+        else distance = 6.0;
+
+        // Determine position based on brightness distribution
+        const leftRegion = canvas.width / 3;
+        const rightRegion = (canvas.width * 2) / 3;
+
+        let leftBrightness = 0,
+          centerBrightness = 0,
+          rightBrightness = 0;
+        let leftCount = 0,
+          centerCount = 0,
+          rightCount = 0;
+
+        for (
+          let y = centerY - regionSize / 2;
+          y < centerY + regionSize / 2;
+          y++
+        ) {
+          for (
+            let x = centerX - regionSize / 2;
+            x < centerX + regionSize / 2;
+            x++
+          ) {
+            if (x < 0 || x >= canvas.width || y < 0 || y >= canvas.height)
+              continue;
+
+            const idx = (y * canvas.width + x) * 4;
+            const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+
+            if (x < leftRegion) {
+              leftBrightness += brightness;
+              leftCount++;
+            } else if (x < rightRegion) {
+              centerBrightness += brightness;
+              centerCount++;
+            } else {
+              rightBrightness += brightness;
+              rightCount++;
+            }
+          }
+        }
+
+        leftBrightness /= leftCount || 1;
+        centerBrightness /= centerCount || 1;
+        rightBrightness /= rightCount || 1;
+
+        let position = "center";
+        if (
+          leftBrightness > centerBrightness &&
+          leftBrightness > rightBrightness
+        )
+          position = "left";
+        else if (
+          rightBrightness > centerBrightness &&
+          rightBrightness > leftBrightness
+        )
+          position = "right";
+
+        return {
+          hasWall: true,
+          distance: Number.parseFloat(distance.toFixed(1)),
+          position,
+        };
+      }
+
+      return null;
+    },
+    []
   );
+
+  const detectObjects = useCallback(async () => {
+    if (isSpeaking) {
+      return;
+    }
+
+    const video = videoRef.current;
+    const model = modelRef.current;
+
+    if (!video || !model || video.readyState !== 4) return;
+
+    try {
+      const predictions = await model.detect(video);
+
+      // Priority 1: Detect people (highest priority)
+      const people = predictions.filter((p) => p.class === "person");
+
+      if (people.length > 0) {
+        const closestPerson = people.reduce((closest, current) => {
+          const closestDist = estimateDistance(
+            closest.bbox,
+            video.videoWidth,
+            "person"
+          );
+          const currentDist = estimateDistance(
+            current.bbox,
+            video.videoWidth,
+            "person"
+          );
+          return currentDist < closestDist ? current : closest;
+        });
+
+        const distance = estimateDistance(
+          closestPerson.bbox,
+          video.videoWidth,
+          "person"
+        );
+        const position = getPosition(closestPerson.bbox, video.videoWidth);
+
+        let announcement = "";
+        if (distance < 2) {
+          announcement = `Very close person ${position} about ${distance} meters`;
+        } else {
+          announcement = `Person ${position} about ${distance} meters away`;
+        }
+
+        const now = Date.now();
+        if (
+          announcement !== lastDetectionRef.current ||
+          now - lastAnnouncementTimeRef.current > 4000
+        ) {
+          setDetections([announcement]);
+          lastDetectionRef.current = announcement;
+          lastAnnouncementTimeRef.current = now;
+        }
+        return;
+      }
+
+      // Priority 2: Detect vehicles (cars, trucks, motorcycles)
+      const vehicles = predictions.filter((p) =>
+        ["car", "truck", "motorcycle", "bus"].includes(p.class)
+      );
+
+      if (vehicles.length > 0) {
+        const closestVehicle = vehicles.reduce((closest, current) => {
+          const closestDist = estimateDistance(
+            closest.bbox,
+            video.videoWidth,
+            current.class
+          );
+          const currentDist = estimateDistance(
+            current.bbox,
+            video.videoWidth,
+            current.class
+          );
+          return currentDist < closestDist ? current : closest;
+        });
+
+        const distance = estimateDistance(
+          closestVehicle.bbox,
+          video.videoWidth,
+          closestVehicle.class
+        );
+        const position = getPosition(closestVehicle.bbox, video.videoWidth);
+
+        const announcement = `${closestVehicle.class} ${position} about ${distance} meters away`;
+
+        const now = Date.now();
+        if (
+          announcement !== lastDetectionRef.current ||
+          now - lastAnnouncementTimeRef.current > 4000
+        ) {
+          setDetections([announcement]);
+          lastDetectionRef.current = announcement;
+          lastAnnouncementTimeRef.current = now;
+        }
+        return;
+      }
+
+      // Priority 3: Detect other obstacles (furniture, hazards, structural objects, etc.)
+      const obstacles = predictions.filter((p) =>
+        [
+          // Furniture and indoor objects
+          "chair",
+          "couch",
+          "bed",
+          "dining table",
+          "door",
+          "tv",
+          "laptop",
+          "bottle",
+          "cup",
+          "backpack",
+          "handbag",
+          "suitcase",
+          // Hazard objects
+          "umbrella",
+          "sports ball",
+          "baseball bat",
+          "tennis racket",
+          "potted plant",
+          "plant",
+          "traffic cone",
+          "bench",
+          "railing",
+          "fence",
+          "pole",
+          "skateboard",
+          "bicycle",
+          "motorcycle helmet",
+          // Animals
+          "dog",
+          "cat",
+          "bird",
+          "teddy bear",
+          // Outdoor hazards
+          "kite",
+          "frisbee",
+          "stairs",
+          "step",
+          "ramp",
+          "escalator",
+          "elevator",
+          "pillar",
+          "column",
+          "barrier",
+          "gate",
+          "sign",
+          "lamp",
+          "street light",
+          "hydrant",
+          "mailbox",
+          "trash can",
+          "dumpster",
+          "wall",
+          "building",
+          "bridge",
+          "tunnel",
+          "curb",
+          "manhole",
+          "grate",
+          "bollard",
+          "post",
+          "tree",
+          "bush",
+          "rock",
+          "log",
+          "branch",
+          "stick",
+        ].includes(p.class)
+      );
+
+      if (obstacles.length > 0) {
+        const closestObstacle = obstacles.reduce((closest, current) => {
+          const closestDist = estimateDistance(
+            closest.bbox,
+            video.videoWidth,
+            current.class
+          );
+          const currentDist = estimateDistance(
+            current.bbox,
+            video.videoWidth,
+            current.class
+          );
+          return currentDist < closestDist ? current : closest;
+        });
+
+        const distance = estimateDistance(
+          closestObstacle.bbox,
+          video.videoWidth,
+          closestObstacle.class
+        );
+        const position = getPosition(closestObstacle.bbox, video.videoWidth);
+
+        const announcement = `${closestObstacle.class} ${position} about ${distance} meters away`;
+
+        const now = Date.now();
+        if (
+          announcement !== lastDetectionRef.current ||
+          now - lastAnnouncementTimeRef.current > 4000
+        ) {
+          setDetections([announcement]);
+          lastDetectionRef.current = announcement;
+          lastAnnouncementTimeRef.current = now;
+        }
+        return;
+      }
+
+      // Priority 4: Detect walls
+      const wallDetection = detectWall(video);
+      if (wallDetection && wallDetection.hasWall) {
+        const announcement = `Wall ${wallDetection.position} about ${wallDetection.distance} meters ahead`;
+
+        const now = Date.now();
+        if (
+          announcement !== lastDetectionRef.current ||
+          now - lastAnnouncementTimeRef.current > 4000
+        ) {
+          setDetections([announcement]);
+          lastDetectionRef.current = announcement;
+          lastAnnouncementTimeRef.current = now;
+        }
+        return;
+      }
+
+      // No objects detected - announce clear path less frequently
+      const now = Date.now();
+      if (now - lastAnnouncementTimeRef.current > 6000) {
+        const announcement = "Clear path ahead";
+        if (announcement !== lastDetectionRef.current) {
+          setDetections([announcement]);
+          lastDetectionRef.current = announcement;
+          lastAnnouncementTimeRef.current = now;
+        }
+      }
+    } catch (error) {
+      console.error("[v0] Detection error:", error);
+    }
+  }, [videoRef, isSpeaking, detectWall]);
+
+  const startDetection = useCallback(async () => {
+    if (detectionIntervalRef.current) {
+      clearInterval(detectionIntervalRef.current);
+    }
+
+    detectionIntervalRef.current = setInterval(() => {
+      detectObjects();
+    }, 1000);
+  }, [detectObjects]);
+
+  const stopDetection = useCallback(() => {
+    if (detectionIntervalRef.current) {
+      clearInterval(detectionIntervalRef.current);
+      detectionIntervalRef.current = null;
+    }
+    setDetections([]);
+    lastDetectionRef.current = "";
+  }, []);
+
+  return {
+    detections,
+    isModelLoading,
+    startDetection,
+    stopDetection,
+  };
 }
